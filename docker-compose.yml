@@ -1,0 +1,43 @@
+services:
+  mongo:
+    image: mongo:6.0
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - mongo
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb+srv://harshan:harshan165@nodetuts.tpaodc0.mongodb.net/insulin-predictor?retryWrites=true&w=majority&appName=nodetuts}
+      - SECRET_KEY=${SECRET_KEY:-dev_secret}
+      - HOST=0.0.0.0
+      - PORT=5001
+      - DEV_FAKE_OTP=true
+      - DEFAULT_COUNTRY_CODE=+91
+      # Optional: Google/Twilio creds can be passed via env or .env file
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER:-}
+    ports:
+      - "5001:5001"
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+    # If you want live reload during local dev, you could mount the backend folder instead of copying
+    # volumes:
+    #   - ./backend:/app/backend
+volumes:
+  mongo_data:

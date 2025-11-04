@@ -16,6 +16,7 @@ interface AuthResponse {
 }
 
 const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
+  const API = (import.meta as any).env?.VITE_API_BASE || (import.meta as any).env?.VITE_API_URL || 'http://localhost:5001';
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -58,7 +59,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
 
     try {
       const endpoint = isLogin ? '/api/login' : '/api/register';
-      const response = await fetch(`http://localhost:5001${endpoint}`, {
+      const response = await fetch(`${API}${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -134,7 +135,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     setError(null);
 
     // Direct redirect to Google OAuth endpoint
-    window.location.href = 'http://localhost:5001/api/auth/google';
+    window.location.href = `${API}/api/auth/google`;
   };
 
   // Email OTP handlers
@@ -142,7 +143,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     try {
       setIsLoading(true);
       setError(null);
-      const res = await fetch('http://localhost:5001/api/request-otp-email', {
+      const res = await fetch(`${API}/api/request-otp-email`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -166,7 +167,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     try {
       setIsLoading(true);
       setError(null);
-      const res = await fetch('http://localhost:5001/api/verify-otp-email', {
+      const res = await fetch(`${API}/api/verify-otp-email`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -194,7 +195,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     try {
       setIsLoading(true);
       setError(null);
-      const res = await fetch('http://localhost:5001/api/set-password', {
+      const res = await fetch(`${API}/api/set-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -219,7 +220,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     try {
       setIsLoading(true);
       setError(null);
-      const res = await fetch('http://localhost:5001/api/request-otp-mobile', {
+      const res = await fetch(`${API}/api/request-otp-mobile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -243,7 +244,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     try {
       setIsLoading(true);
       setError(null);
-      const res = await fetch('http://localhost:5001/api/verify-otp-mobile', {
+      const res = await fetch(`${API}/api/verify-otp-mobile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -271,7 +272,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
     try {
       setIsLoading(true);
       setError(null);
-      const res = await fetch('http://localhost:5001/api/set-password-mobile', {
+      const res = await fetch(`${API}/api/set-password-mobile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',

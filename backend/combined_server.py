@@ -8,6 +8,8 @@ Sections:
 - OAUTH: Google OAuth login flow
 """
 
+from __future__ import annotations
+
 import os
 import requests
 import math
@@ -21,6 +23,7 @@ from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
+from bson.objectid import ObjectId
 import bcrypt
 import logging
 from datetime import datetime, timedelta
@@ -36,18 +39,127 @@ from scipy.stats import pearsonr
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', 'http://localhost:5173')
+BACKEND_BASE_URL = os.environ.get('BACKEND_BASE_URL', 'http://localhost:5001')
+
+def initialize_default_models():
+    """Initialize default models when saved models are not found"""
+    global mlp_model, label_encoder, pca_model
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.decomposition import PCA
+    
+    # Initialize label encoder with default classes
+    label_encoder = LabelEncoder()
+    default_classes = ['Benign', 'Likely Benign', 'Likely Pathogenic', 'Pathogenic']
+    label_encoder.classes_ = np.array(default_classes)
+    
+    # Initialize PCA
+    pca_model = PCA(n_components=256)  # Using default dimension
+    
+    # Save initialized models
+    models_dir = os.path.join(os.path.dirname(__file__), 'models')
+    os.makedirs(models_dir, exist_ok=True)
+    
+    joblib.dump(label_encoder, os.path.join(models_dir, 'label_encoder.pkl'))
+    joblib.dump(pca_model, os.path.join(models_dir, 'pca_model.pkl'))
+    
+    logger.info("Initialized and saved default models")
+    return True
+
+def load_ml_models():
+    """Load machine learning models and return their status"""
+    global mlp_model, label_encoder, pca_model, device
+    
+    try:
+        models_dir = os.path.join(os.path.dirname(__file__), 'models')
+        
+        # Check if all required files exist
+        required_files = {
+            'label_encoder': 'label_encoder.pkl',
+            'pca_model': 'pca_model.pkl',
+            'mlp_model': 'best_mlp_medium_adv.pth'
+        }
+        
+        for key, filename in required_files.items():
+            file_path = os.path.join(models_dir, filename)
+            if not os.path.exists(file_path):
+                logger.error(f"Required file {filename} not found in {models_dir}")
+                return False
+        
+        # Load label encoder first
+        label_encoder_path = os.path.join(models_dir, 'label_encoder.pkl')
+        label_encoder = joblib.load(label_encoder_path)
+        logger.info(f"Label encoder loaded with classes: {label_encoder.classes_}")
+
+        # Load PCA model
+        pca_model_path = os.path.join(models_dir, 'pca_model.pkl')
+        pca_model = joblib.load(pca_model_path)
+        logger.info(f"PCA model loaded with n_components: {pca_model.n_components_}")
+
+        # Load MLP model
+        mlp_path = os.path.join(models_dir, 'best_mlp_medium_adv.pth')
+        input_dim = pca_model.n_components_  # Use PCA output dimension
+        num_classes = len(label_encoder.classes_)
+        
+        # Initialize MLP model
+        mlp_model = MLP(
+            input_dim=input_dim,
+            hidden1=HIDDEN_DIM_1,
+            hidden2=HIDDEN_DIM_2,
+            num_classes=num_classes,
+            dropout=DROPOUT
+        ).to(device)
+        
+        # Load the state dict
+        state_dict = torch.load(mlp_path, map_location=device)
+        mlp_model.load_state_dict(state_dict)
+        mlp_model.eval()
+        logger.info(f"MLP model loaded successfully with input_dim={input_dim}, num_classes={num_classes}")
+
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error loading models: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
 
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-# Allow frontend origin with credentials
-CORS(app, supports_credentials=True, resources={r"/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+
+# Configure CORS
+CORS(app, 
+     origins=[FRONTEND_ORIGIN],
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization"],
+     expose_headers=["Content-Type"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
 # MongoDB configuration
 MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/')
 client = MongoClient(MONGO_URI)
+
+@app.before_request
+def before_request():
+    """Log incoming requests"""
+    logger.info(f"Incoming {request.method} request to {request.path}")
+
+@app.after_request
+def after_request(response):
+    response.headers.set('Access-Control-Allow-Origin', FRONTEND_ORIGIN)
+    response.headers.set('Access-Control-Allow-Credentials', 'true')
+    response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+    response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    return response
 db = client['protein_prediction_db']
 users_collection = db['users']
 otps_collection = db['otps']
@@ -126,11 +238,32 @@ label_encoder = None
 pca_model = None
 sequence_generator = None
 protein_to_smile = None
+new_classifier_model = None
+new_label_encoder = None
 
-# Custom tokenizer setup (same as model_server)
+# Vocabulary for tokenization (must be defined before usage)
 AMINO_ACIDS = list("ACDEFGHIKLMNPQRSTVWY")
 SPECIAL_TOKENS = ["<PAD>", "<SOS>", "<EOS>", "<UNK>"]
 VOCAB = SPECIAL_TOKENS + AMINO_ACIDS
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden1=512, hidden2=256, num_classes=4, dropout=0.4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden1),
+            nn.BatchNorm1d(hidden1),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden1, hidden2),
+            nn.BatchNorm1d(hidden2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden2, num_classes)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
 token2idx = {tok: idx for idx, tok in enumerate(VOCAB)}
 PAD_ID = token2idx["<PAD>"]
 SOS_ID = token2idx["<SOS>"]
@@ -142,6 +275,35 @@ def tokenize(seq: str):
         ids.append(token2idx.get(ch, token2idx["<UNK>"]))
     ids.append(EOS_ID)
     return ids
+
+def tokenize_ids(seq: str, max_length: int):
+    """Tokenize to fixed-length ids and attention mask for new classifier."""
+    ids = [SOS_ID]
+    for ch in seq.strip().upper():
+        ids.append(token2idx.get(ch, token2idx["<UNK>"]))
+    ids.append(EOS_ID)
+    if len(ids) > max_length:
+        ids = ids[:max_length-1] + [EOS_ID]
+    padded = ids + [PAD_ID] * (max_length - len(ids))
+    attn_mask = [1 if x != PAD_ID else 0 for x in padded]
+    return (
+        torch.tensor(padded, dtype=torch.long),
+        torch.tensor(attn_mask, dtype=torch.long),
+    )
+
+def sliding_center_window(seq: str, center_len: int = 50) -> str:
+    """Get center window of sequence, pad with 'A' if shorter."""
+    s = seq.strip().upper()
+    L = len(s)
+    if L <= center_len:
+        return s.ljust(center_len, 'A')
+    mid = L // 2
+    start = max(0, mid - center_len // 2)
+    end = start + center_len
+    if end > L:
+        end = L
+        start = max(0, end - center_len)
+    return s[start:end]
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, n_head, attn_dropout=0.1):
@@ -194,6 +356,50 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.ln1(x), mask)
         x = x + self.ff(self.ln2(x))
         return x
+
+class DualProteinClassifier(nn.Module):
+    def __init__(self, base_model: ProteinLM, d_model=256, proj_dim=256, hidden1=512, hidden2=256, num_classes=2, dropout=0.4):
+        super().__init__()
+        self.base = base_model
+        self.proj_full = nn.Sequential(
+            nn.Linear(d_model, proj_dim),
+            nn.ReLU(),
+            nn.LayerNorm(proj_dim),
+        )
+        self.proj_sub = nn.Sequential(
+            nn.Linear(d_model, proj_dim),
+            nn.ReLU(),
+            nn.LayerNorm(proj_dim),
+        )
+        in_dim = proj_dim * 2
+        self.classifier = nn.Sequential(
+            nn.Linear(in_dim, hidden1),
+            nn.BatchNorm1d(hidden1),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden1, hidden2),
+            nn.BatchNorm1d(hidden2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden2, num_classes),
+        )
+
+    def forward(self, full_ids, full_mask, sub_ids, sub_mask):
+        full_out = self.base(full_ids, attention_mask=full_mask)
+        full_emb = (full_out * full_mask.unsqueeze(-1)).sum(dim=1) / (
+            full_mask.sum(dim=1, keepdim=True).clamp(min=1).to(full_out.dtype)
+        )
+        full_proj = self.proj_full(full_emb)
+
+        sub_out = self.base(sub_ids, attention_mask=sub_mask)
+        sub_emb = (sub_out * sub_mask.unsqueeze(-1)).sum(dim=1) / (
+            sub_mask.sum(dim=1, keepdim=True).clamp(min=1).to(sub_out.dtype)
+        )
+        sub_proj = self.proj_sub(sub_emb)
+
+        x = torch.cat([full_proj, sub_proj], dim=1)
+        logits = self.classifier(x)
+        return logits
 
 class ProteinLM(nn.Module):
     def __init__(self, vocab_size=len(VOCAB), d_model=256, nhead=8, num_layers=6, d_ff=1024, max_len=1024, dropout=0.1):
@@ -278,6 +484,70 @@ def load_models():
     except Exception as e:
         logger.error(f"[Model] Load error: {e}")
         raise
+
+def load_new_classifier_models():
+    """Load DualProteinClassifier and its label encoder from backend/models directory."""
+    global new_classifier_model, new_label_encoder
+    try:
+        models_dir = os.path.join(os.path.dirname(__file__), 'models')
+        le_path = os.path.join(models_dir, 'label_encoder.pkl')
+        fold_path = os.path.join(models_dir, 'best_model_fold5.pth')
+
+        if not os.path.exists(le_path) or not os.path.exists(fold_path):
+            logger.warning(f"[NewClassifier] Missing model files in {models_dir}. Found label_encoder={os.path.exists(le_path)}, fold={os.path.exists(fold_path)}")
+            return False
+
+        new_label_encoder = joblib.load(le_path)
+        num_classes = len(new_label_encoder.classes_)
+
+        base = ProteinLM()
+        model = DualProteinClassifier(base_model=base, d_model=base.d_model, proj_dim=256, hidden1=512, hidden2=256, num_classes=num_classes, dropout=0.4)
+        sd = torch.load(fold_path, map_location=device)
+        model.load_state_dict(sd)
+        model.to(device)
+        model.eval()
+        new_classifier_model = model
+        logger.info(f"[NewClassifier] Loaded model with {num_classes} classes: {list(new_label_encoder.classes_)}")
+        return True
+    except Exception as e:
+        logger.error(f"[NewClassifier] Load error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        new_classifier_model = None
+        new_label_encoder = None
+        return False
+
+@torch.no_grad()
+def predict_new_classifier(full_sequence: str, sub_sequence: str | None = None):
+    """Run inference using the DualProteinClassifier. Returns (label, confidence_float, prob_map)."""
+    if new_classifier_model is None or new_label_encoder is None:
+        raise RuntimeError("New classifier not loaded")
+
+    # Basic validation using same amino set
+    valid = set("ACDEFGHIKLMNPQRSTVWY")
+    s = full_sequence.strip().upper()
+    if not s or not all(c in valid for c in s):
+        raise ValueError("Invalid amino acid sequence")
+
+    # Build subsequence if not provided
+    if not sub_sequence:
+        sub_sequence = sliding_center_window(s, center_len=50)
+
+    fid, fmask = tokenize_ids(s, 512)
+    sid, smask = tokenize_ids(sub_sequence, 128)
+
+    fid = fid.unsqueeze(0).to(device)
+    fmask = fmask.unsqueeze(0).to(device)
+    sid = sid.unsqueeze(0).to(device)
+    smask = smask.unsqueeze(0).to(device)
+
+    logits = new_classifier_model(fid, fmask, sid, smask)
+    probs = F.softmax(logits, dim=1)[0]
+    idx = int(torch.argmax(probs).item())
+    conf = float(probs[idx].item())
+    pred = new_label_encoder.inverse_transform([idx])[0]
+    prob_map = {new_label_encoder.classes_[i]: float(probs[i].item()) for i in range(len(new_label_encoder.classes_))}
+    return pred, conf, prob_map
 
 @torch.no_grad()
 def embed_sequence(seq: str):
@@ -486,42 +756,84 @@ def generate_smiles(input_seq: str) -> str:
 
 @app.route('/health', methods=['GET'])
 def health():
+    new_loaded = (new_classifier_model is not None and new_label_encoder is not None)
+    legacy_loaded = all([
+        custom_protein_lm is not None,
+        mlp_model is not None,
+        label_encoder is not None,
+        pca_model is not None,
+    ])
     return jsonify({
         'status': 'healthy',
         'service': 'authentication+prediction',
-        'models_loaded': all([custom_protein_lm is not None, mlp_model is not None, label_encoder is not None, pca_model is not None])
+        'models_loaded': (new_loaded or legacy_loaded),
+        'new_classifier_loaded': new_loaded,
+        'legacy_models_loaded': legacy_loaded,
     })
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
         data = request.get_json() or {}
-        seq = data.get('sequence', '')
-        proc = preprocess_sequence(seq)
-        emb = embed_sequence(proc)
-        if pca_model is not None:
-            emb = pca_model.transform(emb)
-        X = torch.tensor(emb, dtype=torch.float32).to(device)
-        logits = mlp_model(X)
-        probs = F.softmax(logits, dim=1)
-        idx = torch.argmax(probs, dim=1).item()
-        conf = probs[0, idx].item()
-        pred = label_encoder.classes_[idx]
-        prob_map = {label_encoder.classes_[i]: probs[0, i].item() for i in range(len(label_encoder.classes_))}
+        seq = (data.get('sequence') or '').strip().upper()
+        if not seq:
+            return jsonify({'success': False, 'error': 'No sequence provided'}), 400
+
+        if new_classifier_model is None or new_label_encoder is None:
+            logger.error("New classifier not loaded")
+            return jsonify({'success': False, 'error': 'Models not loaded'}), 503
+
+        try:
+            pred, conf, prob_map = predict_new_classifier(seq)
+        except ValueError as ve:
+            logger.error(f"Validation error: {str(ve)}")
+            return jsonify({'success': False, 'error': str(ve)}), 400
+
         return jsonify({
             'success': True,
             'result': {
                 'prediction': pred,
                 'confidence': conf,
                 'probabilities': prob_map
-            },
-            'processed_sequence': proc
+            }
         })
-    except ValueError as ve:
-        return jsonify({'success': False, 'error': str(ve)}), 400
     except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        return jsonify({'success': False, 'error': 'Prediction failed'}), 500
+        logger.error(f"Prediction error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'success': False, 'error': 'Internal server error during prediction'}), 500
+
+@app.route('/predict-new-classifier', methods=['POST'])
+def predict_new_classifier_endpoint():
+    """Prediction endpoint for the new DualProteinClassifier model."""
+    try:
+        data = request.get_json() or {}
+        seq = (data.get('sequence') or '').strip().upper()
+        sub_seq = data.get('subsequence')
+
+        if not seq:
+            return jsonify({'success': False, 'error': 'No sequence provided'}), 400
+
+        if new_classifier_model is None or new_label_encoder is None:
+            return jsonify({'success': False, 'error': 'New classifier not loaded'}), 503
+
+        try:
+            pred, conf, prob_map = predict_new_classifier(seq, sub_seq)
+        except ValueError as ve:
+            return jsonify({'success': False, 'error': str(ve)}), 400
+
+        return jsonify({
+            'success': True,
+            'result': {
+                'prediction': pred,
+                'confidence': conf,
+                'probabilities': prob_map,
+            },
+            'processed_sequence': seq,
+        })
+    except Exception as e:
+        logger.error(f"New classifier prediction error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
 @app.route('/classes', methods=['GET'])
 def classes():
@@ -679,9 +991,17 @@ def register():
             'error': 'Registration failed'
         }), 500
 
-@app.route('/api/login', methods=['POST'])
+@app.route('/api/login', methods=['POST', 'OPTIONS'])
 def login():
     """Login user"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Credentials', 'true')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST')
+        response.headers.add('Access-Control-Allow-Origin', FRONTEND_ORIGIN)
+        return response
+
     try:
         data = request.get_json()
         username = data.get('username', '').strip()
@@ -852,11 +1172,17 @@ def check_auth():
                     'username': session['username']
                 }
             })
-        else:
-            return jsonify({
-                'success': True,
-                'authenticated': False
-            })
+        return jsonify({
+            'success': True,
+            'authenticated': False
+        })
+    except Exception as e:
+        logger.error(f"Check auth error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'authenticated': False,
+            'error': str(e)
+        }), 500
             
     except Exception as e:
         logger.error(f"Auth check error: {str(e)}")
@@ -882,7 +1208,7 @@ def google_auth():
         auth_url = 'https://accounts.google.com/o/oauth2/v2/auth'
         params = {
             'client_id': GOOGLE_CLIENT_ID,
-            'redirect_uri': 'http://localhost:5001/api/auth/google/callback',
+            'redirect_uri': f'{BACKEND_BASE_URL}/api/auth/google/callback',
             'scope': 'openid email profile',
             'response_type': 'code',
             'access_type': 'offline',
@@ -909,10 +1235,10 @@ def google_auth_callback():
         if error:
             logger.error(f"Google OAuth error: {error}")
             # Redirect to frontend with error
-            return redirect(f"http://localhost:5173?auth=error&error={error}")
+            return redirect(f"{FRONTEND_ORIGIN}?auth=error&error={error}")
         
         if not code:
-            return redirect("http://localhost:5173?auth=error&error=no_code")
+            return redirect(f"{FRONTEND_ORIGIN}?auth=error&error=no_code")
         
         # Exchange code for tokens
         try:
@@ -921,7 +1247,7 @@ def google_auth_callback():
             GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
             
             if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-                return redirect("http://localhost:5173?auth=error&error=oauth_not_configured")
+                return redirect(f"{FRONTEND_ORIGIN}?auth=error&error=oauth_not_configured")
             
             token_url = 'https://oauth2.googleapis.com/token'
             token_data = {
@@ -929,7 +1255,7 @@ def google_auth_callback():
                 'client_secret': GOOGLE_CLIENT_SECRET,
                 'code': code,
                 'grant_type': 'authorization_code',
-                'redirect_uri': 'http://localhost:5001/api/auth/google/callback'
+                'redirect_uri': f'{BACKEND_BASE_URL}/api/auth/google/callback'
             }
             
             token_response = requests.post(token_url, data=token_data)
@@ -949,7 +1275,7 @@ def google_auth_callback():
             name = user_info.get('name')
             
             if not google_id or not email:
-                return redirect("http://localhost:5173?auth=error&error=invalid_user_info")
+                return redirect(f"{FRONTEND_ORIGIN}?auth=error&error=invalid_user_info")
             
             # Check if user exists by Google ID
             existing_user = users_collection.find_one({'google_id': google_id})
@@ -984,15 +1310,15 @@ def google_auth_callback():
             
             logger.info(f"Google OAuth login successful: {username}")
             # Redirect to frontend with success
-            return redirect(f"http://localhost:5173?auth=success&user={username}")
+            return redirect(f"{FRONTEND_ORIGIN}?auth=success&user={username}")
             
         except requests.RequestException as e:
             logger.error(f"Google OAuth token exchange error: {str(e)}")
-            return redirect("http://localhost:5173?auth=error&error=token_exchange_failed")
+            return redirect(f"{FRONTEND_ORIGIN}?auth=error&error=token_exchange_failed")
         
     except Exception as e:
         logger.error(f"Google OAuth callback error: {str(e)}")
-        return redirect("http://localhost:5173?auth=error&error=callback_failed")
+        return redirect(f"{FRONTEND_ORIGIN}?auth=error&error=callback_failed")
 
 @app.route('/api/set-password-google', methods=['POST'])
 def set_password_google():
@@ -1017,11 +1343,32 @@ def set_password_google():
         return jsonify({'success': False, 'error': 'set_password_google_failed'}), 500
 
 if __name__ == '__main__':
-    logger.info("Starting Authentication Server...")
-    logger.info(f"MongoDB URI: {MONGO_URI}")
-    # Load models at startup
+    import sys
     try:
-        load_models()
+        print("Starting Flask server on http://localhost:5001")
+        
+        # Try to load ML models
+        logger.info("Loading ML models...")
+        if not load_ml_models():
+            logger.warning("Server starting without ML models. Prediction endpoints will return 503.")
+        else:
+            logger.info("All ML models loaded successfully")
+        # Try to load new classifier models
+        logger.info("[NewClassifier] Loading models...")
+        if not load_new_classifier_models():
+            logger.warning("[NewClassifier] Starting without new classifier. /predict-new-classifier will return 503 until models are placed in backend/models.")
+        else:
+            logger.info("[NewClassifier] Models loaded successfully")
+        
+        # Disable reloader to prevent socket issues
+        app.run(
+            host=os.environ.get('HOST', '0.0.0.0'),
+            port=int(os.environ.get('PORT', 5001)),
+            debug=True,
+            use_reloader=False,
+            threaded=True
+        )
+        
     except Exception as e:
-        logger.error(f"Failed to load models at startup: {e}")
-    app.run(host='0.0.0.0', port=5001, debug=True)
+        logger.error(f"Error starting server: {str(e)}")
+        sys.exit(1)
