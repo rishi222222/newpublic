@@ -44,8 +44,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', 'http://localhost:5173')
-BACKEND_BASE_URL = os.environ.get('BACKEND_BASE_URL', 'http://localhost:5001')
+FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', 'http://localhost:5173').rstrip('/')
+BACKEND_BASE_URL = os.environ.get('BACKEND_BASE_URL', 'http://localhost:5001').rstrip('/')
 
 def initialize_default_models():
     """Initialize default models when saved models are not found"""
@@ -132,8 +132,14 @@ def load_ml_models():
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production
+
+# Cross-site cookie settings: for OAuth/front-backend on different domains, we need SameSite=None; Secure on HTTPS
+_session_secure_env = os.environ.get('SESSION_SECURE', '').lower() == 'true'
+_is_https_backend = BACKEND_BASE_URL.lower().startswith('https://')
+_secure_mode = _session_secure_env or _is_https_backend
+
+app.config['SESSION_COOKIE_SAMESITE'] = 'None' if _secure_mode else 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = True if _secure_mode else False
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 
 # Configure CORS
